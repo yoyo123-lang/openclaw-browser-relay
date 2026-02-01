@@ -53,4 +53,18 @@ Purpose: attach OpenClaw to an existing Chrome tab so the Gateway can automate i
 2. Try reloading the target tab first
 3. Check if another debugger is already attached to the tab
 
+### "Tab not found" error
+This error occurs when the Gateway tries to control a tab that isn't attached to the relay.
+
+**Common causes:**
+- The tab was opened directly by the Gateway (not via `Target.createTarget`)
+- The tab was reloaded and lost its debugger connection
+- Race condition between `browser.open` and `browser.navigate`
+
+**Solution:**
+1. Click the OpenClaw Browser Relay icon on the tab you want to control (badge should show `ON`)
+2. The extension now auto-reattaches tabs after reload
+3. Use the `listAttachedTabs` command to see which tabs are connected
+4. Use `attachTabByUrl` to attach existing tabs by URL pattern
+
 See [README_ERRORS.md](README_ERRORS.md) for detailed error codes and debugging guide.

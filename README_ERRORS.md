@@ -36,15 +36,25 @@ Este repositorio contiene la versión original de la extensión "OpenClaw Browse
 - Reproducir el selector en la consola de la página target: `document.querySelectorAll('<selector>').length`
 - Si la página usa iframes, comprobar communication entre frames y ajustar `all_frames` y `run_at` en manifest
 
-### 4. Tab not attached / detached_session
+### 4. Tab not attached / detached_session / tab not found
 
-**Síntomas:** Errores `Tab not attached` o `detached_session`.
+**Síntomas:** Errores `Tab not attached`, `detached_session`, o `tab not found (no attached Chrome tabs for profile "chrome")`.
 
-**Causa probable:** La pestaña objetivo fue recargada o cerrada entre request y ejecución.
+**Causa probable:**
+- La pestaña objetivo fue recargada o cerrada entre request y ejecución
+- El Gateway abrió una pestaña directamente (no a través de `Target.createTarget`) y no está adjunta al relay
+- Race condition: `browser.open` crea la pestaña pero `browser.navigate` se ejecuta antes de que se complete el attach
 
 **Debug:**
 - Reproducir flujo: attach → perform action → detach. Asegurarse de mantener la pestaña activa
-- Añadir logs con timestamps cuando se attach/detach
+- Usar el comando `listAttachedTabs` desde el Gateway para ver qué pestañas están conectadas
+- Verificar que el badge de la extensión muestra `ON` en la pestaña objetivo
+- Revisar logs del service worker para ver eventos de attach/detach con timestamps
+
+**Solución rápida:**
+1. Hacer clic en el icono de OpenClaw Browser Relay en la pestaña que quieres controlar (debe mostrar `ON`)
+2. Si el Gateway creó la pestaña directamente, usa `attachTabByUrl` con un patrón de URL para adjuntarla
+3. El mensaje de error ahora indica cuántas tabs están adjuntas y sus targetIds para facilitar diagnóstico
 
 ## Cómo generar logs detallados
 
@@ -62,9 +72,52 @@ Este repositorio contiene la versión original de la extensión "OpenClaw Browse
 | 1002 | `selector_not_found` | El selector CSS no encontró elementos |
 | 1003 | `evaluate_error` | Error al ejecutar JavaScript en la página |
 | - | `detached_session` | La sesión de debug fue desconectada |
+| - | `tab not found` | No hay pestañas adjuntas al relay |
 
-## Sugerencias de mejora
+## Comandos de diagnóstico
 
-- Añadir `requestId` a todos los outputs de `console.error` y a respuestas de error
-- Mejorar diagnostics para `evaluate_error`: incluir reason (CSP/frame-blocked/no-content-script/element-not-found) y stack cuando esté disponible
-- Evitar `host_permissions` globales si no son necesarias; restringir a localhost y dominios requeridos
+La extensión soporta comandos especiales para diagnóstico (enviar via WebSocket al relay):
+
+### listAttachedTabs
+
+Lista todas las pestañas actualmente adjuntas.
+
+```json
+{ "id": 1, "method": "listAttachedTabs" }
+```
+
+Respuesta:
+```json
+{
+  "id": 1,
+  "result": {
+    "tabs": [
+      {
+        "tabId": 123,
+        "sessionId": "cb-tab-1",
+        "targetId": "14DC27CEEBBA6C8B2233046A34F29C49",
+        "url": "https://google.com",
+        "title": "Google"
+      }
+    ]
+  }
+}
+```
+
+### attachTabByUrl
+
+Adjunta una pestaña existente por patrón de URL.
+
+```json
+{ "id": 2, "method": "attachTabByUrl", "params": { "urlPattern": "google.com" } }
+```
+
+Útil cuando el Gateway abre pestañas directamente y necesitas adjuntarlas al relay.
+
+## Sugerencias de mejora (implementadas)
+
+- ✅ `requestId` incluido en todos los logs de error
+- ✅ Timestamps ISO 8601 en logs estructurados
+- ✅ Mensaje de error mejorado con info de tabs adjuntas
+- ✅ Auto-reattach cuando una pestaña se recarga
+- ✅ Comandos de diagnóstico (`listAttachedTabs`, `attachTabByUrl`)

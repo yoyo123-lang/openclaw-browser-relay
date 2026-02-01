@@ -188,6 +188,37 @@ async function onRelayMessage(text) {
     return
   }
 
+  if (msg && typeof msg.id === 'number' && msg.method === 'listAttachedTabs') {
+    const attached = []
+    for (const [tabId, tab] of tabs.entries()) {
+      if (tab.state === 'connected') {
+        const chromeTab = await chrome.tabs.get(tabId).catch(() => null)
+        attached.push({
+          tabId,
+          sessionId: tab.sessionId,
+          targetId: tab.targetId,
+          url: chromeTab?.url || 'unknown',
+          title: chromeTab?.title || 'unknown',
+        })
+      }
+    }
+    log('info', 'listAttachedTabs', { count: attached.length })
+    sendToRelay({ id: msg.id, result: { tabs: attached } })
+    return
+  }
+
+  if (msg && typeof msg.id === 'number' && msg.method === 'attachTabByUrl') {
+    const urlPattern = msg?.params?.urlPattern || ''
+    try {
+      const result = await attachTabByUrlPattern(urlPattern)
+      sendToRelay({ id: msg.id, result })
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      sendToRelay({ id: msg.id, error: errorMsg })
+    }
+    return
+  }
+
   if (msg && typeof msg.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
     const p = pending.get(msg.id)
     if (!p) return
@@ -210,6 +241,31 @@ async function onRelayMessage(text) {
       sendToRelay({ id: requestId, error: errorMsg })
     }
   }
+}
+
+async function attachTabByUrlPattern(urlPattern) {
+  const allTabs = await chrome.tabs.query({})
+  const matching = allTabs.filter((t) => {
+    if (!t.url) return false
+    if (!urlPattern) return true
+    return t.url.includes(urlPattern)
+  })
+
+  if (matching.length === 0) {
+    throw new Error(`No tabs found matching pattern: ${urlPattern || '(any)'}`)
+  }
+
+  const tab = matching[0]
+  if (!tab.id) throw new Error('Tab has no id')
+
+  const existing = tabs.get(tab.id)
+  if (existing?.state === 'connected') {
+    return { alreadyAttached: true, tabId: tab.id, sessionId: existing.sessionId, targetId: existing.targetId }
+  }
+
+  await ensureRelayConnection()
+  const attached = await attachTab(tab.id)
+  return { tabId: tab.id, ...attached }
 }
 
 function getTabBySessionId(sessionId) {
@@ -359,8 +415,22 @@ async function handleForwardCdpCommand(msg) {
     })()
 
   if (!tabId) {
-    log('error', 'No attached tab for CDP command', { method, sessionId, targetId })
-    throw new Error(`No attached tab for method ${method}`)
+    const attachedCount = [...tabs.values()].filter((t) => t.state === 'connected').length
+    const attachedTargets = [...tabs.values()]
+      .filter((t) => t.state === 'connected')
+      .map((t) => t.targetId)
+      .join(', ')
+    log('error', 'No attached tab for CDP command', {
+      method,
+      sessionId,
+      targetId,
+      attachedCount,
+      attachedTargets: attachedTargets || 'none',
+    })
+    const hint = attachedCount === 0
+      ? 'No tabs are attached. Click the OpenClaw Browser Relay toolbar icon on a tab to attach it.'
+      : `${attachedCount} tab(s) attached with targetIds: [${attachedTargets}], but none match requested targetId "${targetId || 'none'}".`
+    throw new Error(`No attached tab for method ${method}. ${hint}`)
   }
 
   /** @type {chrome.debugger.DebuggerSession} */
@@ -460,4 +530,47 @@ chrome.action.onClicked.addListener(() => void connectOrToggleForActiveTab())
 chrome.runtime.onInstalled.addListener(() => {
   // Useful: first-time instructions.
   void chrome.runtime.openOptionsPage()
+})
+
+// Auto-attach tabs created by the extension (Target.createTarget) when they finish loading
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Only process tabs that have finished loading
+  if (changeInfo.status !== 'complete') return
+
+  // Check if this tab is already being tracked but not connected
+  const existing = tabs.get(tabId)
+  if (existing?.state === 'connecting') {
+    // Tab was in connecting state, try to complete the attachment
+    log('info', 'Tab finished loading, attempting to complete attachment', { tabId, url: tab.url })
+  }
+})
+
+// Re-attach tabs that were previously attached when they are reloaded
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete') return
+
+  const existing = tabs.get(tabId)
+  if (!existing || existing.state !== 'connected') return
+
+  // Tab was attached but got reloaded - the debugger might have detached
+  // Verify the debugger is still attached
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', { expression: '1' })
+  } catch {
+    // Debugger detached during reload, try to re-attach
+    log('info', 'Debugger detached during reload, re-attaching', { tabId, url: tab.url })
+    try {
+      const oldSessionId = existing.sessionId
+      const oldTargetId = existing.targetId
+
+      // Clean up old state
+      if (oldSessionId) tabBySession.delete(oldSessionId)
+      tabs.delete(tabId)
+
+      // Re-attach
+      await attachTab(tabId, { skipAttachedEvent: false })
+    } catch (err) {
+      log('warn', 'Failed to re-attach tab after reload', { tabId, error: String(err) })
+    }
+  }
 })
