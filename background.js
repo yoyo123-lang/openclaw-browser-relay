@@ -34,6 +34,20 @@ function nowStack() {
   }
 }
 
+function log(level, message, context = {}) {
+  const ts = new Date().toISOString()
+  const prefix = `[OpenClaw ${ts}]`
+  const contextStr = Object.keys(context).length > 0 ? JSON.stringify(context) : ''
+  const fullMessage = contextStr ? `${prefix} ${message} ${contextStr}` : `${prefix} ${message}`
+  if (level === 'error') {
+    console.error(fullMessage)
+  } else if (level === 'warn') {
+    console.warn(fullMessage)
+  } else {
+    console.log(fullMessage)
+  }
+}
+
 async function getRelayPort() {
   const stored = await chrome.storage.local.get(['relayPort'])
   const raw = stored.relayPort
@@ -84,6 +98,7 @@ async function ensureRelayConnection() {
       }
     })
 
+    log('info', 'WebSocket connected to relay', { url: wsUrl })
     ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
     ws.onclose = () => onRelayClosed('closed')
     ws.onerror = () => onRelayClosed('error')
@@ -103,6 +118,7 @@ async function ensureRelayConnection() {
 }
 
 function onRelayClosed(reason) {
+  log('warn', 'Relay connection closed', { reason, pendingRequests: pending.size })
   relayWs = null
   for (const [id, p] of pending.entries()) {
     pending.delete(id)
@@ -182,11 +198,16 @@ async function onRelayMessage(text) {
   }
 
   if (msg && typeof msg.id === 'number' && msg.method === 'forwardCDPCommand') {
+    const requestId = msg.id
+    const method = msg?.params?.method || 'unknown'
     try {
       const result = await handleForwardCdpCommand(msg)
-      sendToRelay({ id: msg.id, result })
+      log('info', 'CDP command success', { requestId, method })
+      sendToRelay({ id: requestId, result })
     } catch (err) {
-      sendToRelay({ id: msg.id, error: err instanceof Error ? err.message : String(err) })
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      log('error', 'CDP command failed', { requestId, method, error: errorMsg })
+      sendToRelay({ id: requestId, error: errorMsg })
     }
   }
 }
@@ -223,6 +244,7 @@ async function attachTab(tabId, opts = {}) {
 
   tabs.set(tabId, { state: 'connected', sessionId, targetId, attachOrder })
   tabBySession.set(sessionId, tabId)
+  log('info', 'Tab attached', { tabId, sessionId, targetId })
   void chrome.action.setTitle({
     tabId,
     title: 'OpenClaw Browser Relay: attached (click to detach)',
@@ -248,6 +270,7 @@ async function attachTab(tabId, opts = {}) {
 
 async function detachTab(tabId, reason) {
   const tab = tabs.get(tabId)
+  log('info', 'Detaching tab', { tabId, reason, sessionId: tab?.sessionId })
   if (tab?.sessionId && tab?.targetId) {
     try {
       sendToRelay({
@@ -311,9 +334,8 @@ async function connectOrToggleForActiveTab() {
       title: 'OpenClaw Browser Relay: relay not running (open options for setup)',
     })
     void maybeOpenHelpOnce()
-    // Extra breadcrumbs in chrome://extensions service worker logs.
     const message = err instanceof Error ? err.message : String(err)
-    console.warn('attach failed', message, nowStack())
+    log('warn', 'attach failed', { tabId, error: message, stack: nowStack() })
   }
 }
 
@@ -336,7 +358,10 @@ async function handleForwardCdpCommand(msg) {
       return null
     })()
 
-  if (!tabId) throw new Error(`No attached tab for method ${method}`)
+  if (!tabId) {
+    log('error', 'No attached tab for CDP command', { method, sessionId, targetId })
+    throw new Error(`No attached tab for method ${method}`)
+  }
 
   /** @type {chrome.debugger.DebuggerSession} */
   const debuggee = { tabId }
